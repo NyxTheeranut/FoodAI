@@ -22,9 +22,10 @@ class _RecipeDetailPageState extends State<RecipeDetailPage> {
   final ApiService _apiService = ApiService();
   Map<String, dynamic>? _recipeDetails;
   bool _isLoading = true;
-  bool _isFavorited = false;
+  bool _isFavorited = false; // Local state for UI
   String? _userEmail;
   String? _errorMessage;
+  bool _isTogglingFavorite = false; // Prevent rapid clicks
 
   // State for interactive instructions
   bool _isStepByStepMode = false;
@@ -34,9 +35,19 @@ class _RecipeDetailPageState extends State<RecipeDetailPage> {
   @override
   void initState() {
     super.initState();
-    _fetchRecipeDetails();
-    _checkLoginStatus();
+    _fetchRecipeDetails(); // Fetch recipe data first
+    _initializePage(); // Then check login and favorite status
   }
+
+  // Combined initialization logic
+  Future<void> _initializePage() async {
+    await _checkLoginStatus();
+    // Only refresh favorite status if logged in
+    if (_userEmail != null) {
+      await _refreshFavoriteStatus();
+    }
+  }
+
 
   Future<void> _checkLoginStatus() async {
     final token = await _apiService.getToken();
@@ -51,10 +62,16 @@ class _RecipeDetailPageState extends State<RecipeDetailPage> {
         );
         if (response.statusCode == 200) {
           final userData = jsonDecode(response.body);
-          setState(() {
-            _userEmail = userData['email'];
-          });
-          _checkIfFavorited();
+          if (mounted) {
+            setState(() {
+              _userEmail = userData['email'];
+            });
+            // Don't call _checkIfFavorited here, handled by _initializePage
+          }
+        } else if (response.statusCode == 401) {
+          // Handle token expiration/invalidation if needed
+          print('User fetch failed: Token invalid (401)');
+          // Optionally clear token and prompt login
         }
       } catch (e) {
         print('Error fetching user: $e');
@@ -95,130 +112,144 @@ class _RecipeDetailPageState extends State<RecipeDetailPage> {
     }
   }
 
-  Future<void> _checkIfFavorited() async {
-    if (_userEmail == null) return;
+  // Renamed and modified from _checkIfFavorited to align with results page
+  Future<void> _refreshFavoriteStatus() async {
+    if (_userEmail == null) {
+      print('Cannot refresh favorite status: User not logged in.');
+      return; // Don't proceed if not logged in
+    }
+    print('Refreshing favorite status for recipe ${widget.recipeId}...');
     try {
-      final response = await http.get(
-        Uri.parse('${ApiService.baseUrl}/favorites'),
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': 'Bearer ${await _apiService.getToken()}',
-        },
-      );
-      if (response.statusCode == 200) {
-        final favorites = jsonDecode(response.body);
-        if (mounted) {
-          setState(() {
-            _isFavorited =
-                favorites.any((fav) => fav['recipe_id'] == widget.recipeId);
-          });
-        }
+      // Use ApiService consistently
+      final favorites = await _apiService.fetchFavorites();
+      if (mounted) {
+        final bool isNowFavorited = favorites.any((fav) =>
+            fav['recipe_id'] != null &&
+            int.tryParse(fav['recipe_id'].toString()) == widget.recipeId);
+        setState(() {
+          _isFavorited = isNowFavorited;
+        });
+        print('Favorite status refreshed. Is favorited: $_isFavorited');
       }
-    } catch (e) {
-      print('Error checking favorites: $e');
+    } catch (e, stackTrace) {
+      print('Error refreshing favorite status: $e');
+      print(stackTrace);
+      // Optionally show a snackbar, but might be annoying on load
     }
   }
 
+
+  // Rewritten _toggleFavorite using ApiService and refresh logic
   Future<void> _toggleFavorite() async {
-    if (_userEmail == null) {
-      showDialog(
+     // Prevent multiple taps while processing
+    if (_isTogglingFavorite) return;
+
+    final isLoggedIn = await _apiService.getToken() != null;
+    if (!isLoggedIn) {
+      _showLoginPrompt(); // Use a separate method for the dialog
+      return;
+    }
+
+    // Ensure recipe details are loaded before trying to favorite
+    if (_recipeDetails == null || _recipeDetails!['recipe'] == null) {
+       ScaffoldMessenger.of(context).showSnackBar(
+         const SnackBar(content: Text('Recipe details not loaded yet.')),
+       );
+       return;
+    }
+
+    setState(() { _isTogglingFavorite = true; });
+
+    try {
+      // --- Refresh state before toggling (like in results page) ---
+      await _refreshFavoriteStatus();
+      // -----------------------------------------------------------
+
+      final bool isCurrentlyFavorite = _isFavorited; // Use the refreshed state
+      final String recipeTitle = _recipeDetails!['recipe']?['title'] ?? 'Unknown Recipe';
+      final String imageUrl = _recipeDetails!['recipe']?['image'] ?? ''; // Use placeholder if needed
+
+      print('Attempting to toggle favorite. Currently favorite: $isCurrentlyFavorite');
+
+      bool success; // Use a single variable for the result
+      if (isCurrentlyFavorite) {
+        success = await _apiService.removeFavorite(widget.recipeId);
+        // ApiService's removeFavorite should ideally return false if successful
+        // Let's assume it returns true on success for now based on addFavorite pattern
+        // We'll update the state based on the intended final state
+        if (success) { // Assuming true means successful removal
+           if (mounted) setState(() { _isFavorited = false; });
+           ScaffoldMessenger.of(context).showSnackBar(
+             const SnackBar(content: Text('Recipe removed from favorites')),
+           );
+        } else {
+           throw Exception('API indicated failure removing favorite.');
+        }
+
+      } else {
+        success = await _apiService.addFavorite(widget.recipeId, recipeTitle, imageUrl);
+         // ApiService's addFavorite should ideally return true if successful
+        if (success) {
+           if (mounted) setState(() { _isFavorited = true; });
+            ScaffoldMessenger.of(context).showSnackBar(
+             const SnackBar(content: Text('Recipe added to favorites')),
+           );
+        } else {
+           throw Exception('API indicated failure adding favorite.');
+        }
+      }
+
+    } catch (e, stackTrace) {
+      print('Error toggling favorite for recipe ${widget.recipeId}: $e');
+      print(stackTrace);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Failed to update favorite status. Error: ${e.runtimeType}')),
+        );
+        // Optionally re-refresh status on error to ensure consistency
+        await _refreshFavoriteStatus();
+      }
+    } finally {
+       if (mounted) {
+         setState(() { _isTogglingFavorite = false; });
+       }
+    }
+  }
+
+  // Extracted Login Prompt Dialog
+  void _showLoginPrompt() {
+     showDialog(
         context: context,
         builder: (context) => AlertDialog(
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15)),
           title: const Text('Login Required'),
-          content: const Text('Please login first to favorite this recipe.'),
+          content: const Text('Please log in to favorite recipes.'),
           actions: [
             TextButton(
               onPressed: () => Navigator.pop(context),
-              child: const Text('Cancel'),
+              child: const Text('Cancel', style: TextStyle(color: Colors.grey)),
             ),
             TextButton(
               onPressed: () {
-                Navigator.pop(context);
+                Navigator.pop(context); // Close dialog
                 Navigator.push(
                   context,
                   MaterialPageRoute(builder: (context) => const LoginPage()),
-                );
+                ).then((_) {
+                  // After login page is popped, re-check login status and favorites
+                  _initializePage();
+                });
               },
+               style: TextButton.styleFrom(
+                 foregroundColor: Colors.blue,
+               ),
               child: const Text('Login'),
             ),
           ],
         ),
       );
-      return;
-    }
-
-    try {
-      final token = await _apiService.getToken();
-      if (token == null) {
-        throw Exception(
-            'Authentication token is missing. Please log in again.');
-      }
-
-      if (_isFavorited) {
-        final response = await http.delete(
-          Uri.parse('${ApiService.baseUrl}/favorites/${widget.recipeId}'),
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': 'Bearer $token',
-          },
-        );
-        print(
-            'Unfavorite Response: ${response.statusCode} - ${response.body}'); // Debug log
-        if (response.statusCode == 200) {
-          if (mounted) {
-            setState(() {
-              _isFavorited = false;
-            });
-            ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(content: Text('Recipe removed from favorites')),
-            );
-            // Recheck favorited status to ensure sync with server
-            await _checkIfFavorited();
-          }
-        } else {
-          throw Exception(
-              'Failed to remove favorite: ${response.statusCode} - ${response.body}');
-        }
-      } else {
-        final response = await http.post(
-          Uri.parse('${ApiService.baseUrl}/favorites'),
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': 'Bearer $token',
-          },
-          body: jsonEncode({
-            'recipe_id': widget.recipeId,
-            'title': _recipeDetails?['recipe']?['title'] ?? 'Unknown Recipe',
-            'image': _recipeDetails?['recipe']?['image'] ?? '',
-          }),
-        );
-        print(
-            'Favorite Response: ${response.statusCode} - ${response.body}'); // Debug log
-        if (response.statusCode == 201) {
-          if (mounted) {
-            setState(() {
-              _isFavorited = true;
-            });
-            ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(content: Text('Recipe added to favorites')),
-            );
-            // Recheck favorited status to ensure sync with server
-            await _checkIfFavorited();
-          }
-        } else {
-          throw Exception(
-              'Failed to add favorite: ${response.statusCode} - ${response.body}');
-        }
-      }
-    } catch (e) {
-      print('Error in _toggleFavorite: $e'); // Debug log
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Error: $e')),
-        );
-      }
-    }
   }
+
 
   String _parseInstructions(String instructions) {
     return instructions.replaceAll('<br>', '\n');
@@ -229,7 +260,6 @@ class _RecipeDetailPageState extends State<RecipeDetailPage> {
     String currentStep = '';
     List<String> lines = instructions.split('\n');
 
-    // Regular expression to detect numbered steps (e.g., "1.", "2.", etc.)
     RegExp stepPattern = RegExp(r'^\d+\.\s');
 
     for (String line in lines) {
@@ -237,19 +267,16 @@ class _RecipeDetailPageState extends State<RecipeDetailPage> {
       if (line.isEmpty) continue;
 
       if (stepPattern.hasMatch(line)) {
-        // If we have accumulated a step, add it to the list
         if (currentStep.isNotEmpty) {
           steps.add(currentStep.trim());
           currentStep = '';
         }
         currentStep = line;
       } else {
-        // Append the line to the current step with a space
         currentStep += ' $line';
       }
     }
 
-    // Add the last step if it exists
     if (currentStep.isNotEmpty) {
       steps.add(currentStep.trim());
     }
@@ -269,7 +296,7 @@ class _RecipeDetailPageState extends State<RecipeDetailPage> {
       if (_currentStepIndex < _instructionSteps.length - 1) {
         _currentStepIndex++;
       } else {
-        _isStepByStepMode = false; // Exit step-by-step mode when done
+        _isStepByStepMode = false;
       }
     });
   }
@@ -413,49 +440,80 @@ class _RecipeDetailPageState extends State<RecipeDetailPage> {
                     if (_recipeDetails?['matchingIngredients'] != null &&
                         (_recipeDetails!['matchingIngredients'] as List)
                             .isNotEmpty)
-                      ...(_recipeDetails!['matchingIngredients'] as List)
-                          .map<Widget>((ingredient) {
-                        bool isMatched = ingredient['matched'] ?? false;
-                        bool showSymbols = widget.userIngredients
-                            .isNotEmpty; // Only show symbols if searching by ingredients
+                      ConstrainedBox(
+                        constraints: BoxConstraints(
+                          maxHeight: MediaQuery.of(context).size.height *
+                              0.5, // Limit to half screen height
+                        ),
+                        child: ListView(
+                          shrinkWrap: true,
+                          physics:
+                              const NeverScrollableScrollPhysics(), // Disable scrolling in ListView
+                          children:
+                              (_recipeDetails!['matchingIngredients'] as List)
+                                  .map<Widget>((ingredient) {
+                            bool isMatched = ingredient['matched'] ?? false;
+                            bool showSymbols = widget.userIngredients
+                                .isNotEmpty; // Only show symbols if searching by ingredients
 
-                        return Padding(
-                          padding: const EdgeInsets.symmetric(vertical: 4.0),
-                          child: Row(
-                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                            children: [
-                              // Combine checkmark and ingredient name into a single Text widget
-                              Flexible(
-                                child: Text(
-                                  (showSymbols
-                                          ? (isMatched ? '✔ ' : '✘ ')
-                                          : '') +
-                                      (ingredient['ingredient']?.toString() ??
-                                          'Unknown'),
-                                  style: TextStyle(
-                                    fontSize: 16,
-                                    color: showSymbols
-                                        ? (isMatched
-                                            ? Colors.green
-                                            : Colors.red)
-                                        : Colors.grey[600],
+                            return Padding(
+                              padding:
+                                  const EdgeInsets.symmetric(vertical: 4.0),
+                              child: Row(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                mainAxisAlignment:
+                                    MainAxisAlignment.spaceBetween,
+                                children: [
+                                  Flexible(
+                                    child: Wrap(
+                                      children: [
+                                        Text(
+                                          showSymbols
+                                              ? (isMatched ? '✔ ' : '✘ ')
+                                              : '',
+                                          style: TextStyle(
+                                            fontSize: 16,
+                                            color: showSymbols
+                                                ? (isMatched
+                                                    ? Colors.green
+                                                    : Colors.red)
+                                                : Colors.grey[600],
+                                          ),
+                                        ),
+                                        Text(
+                                          ingredient['ingredient']?.toString() ??
+                                              'Unknown',
+                                          style: TextStyle(
+                                            fontSize: 16,
+                                            color: showSymbols
+                                                ? (isMatched
+                                                    ? Colors.green
+                                                    : Colors.red)
+                                                : Colors.grey[600],
+                                          ),
+                                        ),
+                                      ],
+                                    ),
                                   ),
-                                  overflow: TextOverflow.ellipsis,
-                                ),
+                                  const SizedBox(
+                                      width: 8), // Small gap between name and amount
+                                  Text(
+                                    '(${ingredient['metricAmount']?.toString() ?? '0'} ${ingredient['metricUnit']?.toString() ?? ''})',
+                                    style: TextStyle(
+                                      fontSize: 16,
+                                      color: showSymbols
+                                          ? (isMatched
+                                              ? Colors.green
+                                              : Colors.red)
+                                          : Colors.grey[600],
+                                    ),
+                                  ),
+                                ],
                               ),
-                              Text(
-                                '(${ingredient['metricAmount']?.toString() ?? '0'} ${ingredient['metricUnit']?.toString() ?? ''})',
-                                style: TextStyle(
-                                  fontSize: 16,
-                                  color: showSymbols
-                                      ? (isMatched ? Colors.green : Colors.red)
-                                      : Colors.grey[600],
-                                ),
-                              ),
-                            ],
-                          ),
-                        );
-                      }).toList()
+                            );
+                          }).toList(),
+                        ),
+                      )
                     else
                       const Text(
                         'No ingredients available.',
@@ -473,7 +531,6 @@ class _RecipeDetailPageState extends State<RecipeDetailPage> {
                     const SizedBox(height: 8),
                     if (_instructionSteps.isNotEmpty) ...[
                       if (!_isStepByStepMode) ...[
-                        // Show all steps initially
                         Column(
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: _instructionSteps
@@ -515,7 +572,6 @@ class _RecipeDetailPageState extends State<RecipeDetailPage> {
                           ),
                         ),
                       ] else ...[
-                        // Step-by-step mode
                         Column(
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [

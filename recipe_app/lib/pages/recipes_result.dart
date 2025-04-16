@@ -108,20 +108,46 @@ class _RecipeSearchResultPageState extends State<RecipeSearchResultPage> {
       return;
     }
 
+    // --- Diagnostic Step: Refresh favorite states before toggling ---
+    // This ensures we have the latest status before making the add/remove call.
+    // Consider removing this if it doesn't solve the issue, for performance.
+    print('Refreshing favorite states before toggling recipe $recipeId...');
+    await _loadFavoriteStates();
+    print('Favorite states refreshed.');
+    // -------------------------------------------------------------
+
     try {
+      // Check the refreshed state
+      final bool isCurrentlyFavorite = favoriteStates[recipeId] ?? false;
+      print('Attempting to toggle favorite. Currently favorite: $isCurrentlyFavorite');
+
       bool newFavoriteState;
-      if (favoriteStates[recipeId] ?? false) {
+      if (isCurrentlyFavorite) { // Use the refreshed state
         newFavoriteState = await apiService.removeFavorite(recipeId);
       } else {
         newFavoriteState = await apiService.addFavorite(recipeId, recipeTitle, imageUrl);
       }
       setState(() {
-        favoriteStates[recipeId] = newFavoriteState;
+        // Update state only if the API call was successful and returned a boolean
+        if (newFavoriteState is bool) {
+           favoriteStates[recipeId] = newFavoriteState;
+        } else {
+          // Handle cases where the API might not return the expected boolean
+          // Optionally, refetch favorites to ensure consistency
+           print('API did not return expected boolean for favorite toggle. Refetching favorites.');
+           _loadFavoriteStates(); // Refetch to be safe
+        }
       });
-    } catch (e) {
+    } catch (e, stackTrace) {
+      // Log detailed error to console
+      print('Error toggling favorite for recipe $recipeId: $e');
+      print(stackTrace);
+
+      // Show a more informative SnackBar
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Error toggling favorite: $e')),
+        SnackBar(content: Text('Failed to update favorite status. Please try again. Error: ${e.runtimeType}')),
       );
+      // Optionally, revert optimistic UI update if you implement that later
     }
   }
 
